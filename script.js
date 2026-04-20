@@ -98,12 +98,9 @@ function attachHistoryScroll() {
   scrollContainer.dataset.scrollBound = "true";
 }
 function getDataPrincipalId() {
-  if (!dataPrincipalId?.key || !dataPrincipalId?.value) return null;
+  if (!Array.isArray(dataPrincipalId)) return [];
 
-  return {
-    key: dataPrincipalId.key,
-    value: dataPrincipalId.value
-  };
+  return dataPrincipalId.filter(({ key, value }) => key && value);
 }
 
 async function loadMoreHistory() {
@@ -276,10 +273,11 @@ if (data.currentPreference) {
 
 function setDataPrincipalIdList() {
   const { dataPrincipalId } = window.consentWidgetConfig || {};
-  if (dataPrincipalId && dataPrincipalId.key && dataPrincipalId.value) {
-    dataPrincipalIdList.push({
-      key: dataPrincipalId.key,
-      value: dataPrincipalId.value,
+  if (Array.isArray(dataPrincipalId)) {
+    dataPrincipalId.forEach(({ key, value }) => {
+      if (key && value) {
+        dataPrincipalIdList.push({ key, value });
+      }
     });
   }
 }
@@ -444,7 +442,11 @@ async function sendConsent() {
     });
 
     const data = await handleApiResponse(res);
-
+    try {
+      sessionStorage.setItem("consentResponse", JSON.stringify(data));
+    } catch (e) {
+      console.error("Storage failed:", e);
+    }
     if (data.response && data.statusCode === 200) {
       showToast("Consent saved successfully!", "success");
     } else {
