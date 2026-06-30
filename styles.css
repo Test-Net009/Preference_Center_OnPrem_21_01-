@@ -333,12 +333,16 @@ button:hover {
 }
 
 .permission-title .mandatory {
-  color: inherit;
+  color: #ff0000 !important;
   font-size: inherit;
   font-weight: inherit;
   line-height: inherit;
 }
-
+ 
+.mandatory {
+  color: #ff0000 !important;
+}
+  
 #toast {
   position: absolute;
   top: 50%;
@@ -462,3 +466,41 @@ button.loading {
   opacity: 0.6;
   pointer-events: none;
 }
+
+/* Table styles */
+.permission-block table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 8px 0;
+}
+
+.permission-block table td,
+.permission-block table th {
+  border: 1px solid #000;
+  padding: 8px;
+  min-width: 50px;
+  vertical-align: top;
+}
+
+.permission-block table th {
+  font-weight: bold;
+}
+
+/* Strikethrough text fix */
+s, .ql-strike, strike {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  text-decoration-color: inherit;
+  text-underline-offset: 0;
+  text-decoration-skip-ink: none;
+}
+
+/* Ensure strikethrough appears in the center of text */
+.permission-block p s,
+.permission-block p .ql-strike,
+.permission-block p strike {
+  text-decoration-line: line-through;
+  text-decoration-thickness: 1px;
+  text-decoration-color: currentColor;
+}
+

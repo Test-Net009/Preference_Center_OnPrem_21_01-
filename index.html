@@ -69,29 +69,70 @@
 
 <script>
   window.consentWidgetConfig = {
-    preferenceFormId: "085aaed0-d666-4461-83c9-b74ad11044a4",
-    preferenceDetailsApiUrl:"https://starhealth.pre-dataprivacy.com/cpm-api/preference/v1/export/getPreferenceDetails",
-    preferenceHistoryApiUrl:"https://starhealth.pre-dataprivacy.com/cpm-api/preference/v1/export/auditSearch/scroll",
-    submitApiUrl:"https://starhealth.pre-dataprivacy.com/cpm-api/consent/v1/createOrUpdateConsent",
-    userToken: "Bearer eyJhbGciOiJIUzM4NCJ9.eyJkYXRhUHJpbmNpcGFsSWQiOnsia2V5IjoiZW1haWwiLCJ2YWx1ZSI6InRlc3RAeW9wbWFpbC5jb20ifSwiaWF0IjoxNzc4NjU1OTIxLCJleHAiOjE3Nzg3NDIzMjF9.APyCDFZUtYjPnTYS7Yy0AMRCD7vhwl41nvSjmPvt5XOB1Vqb8Mv_FbcwK7g01qWs",
-    dataPrincipalId: [
-      {
-        key: "email",
-        value: "test@yopmail.com"
-      }
-    ],
-
+    preferenceFormId: "bb9d4cbe-fd11-4b16-95b6-490c6b0d8eea",
+    preferenceDetailsApiUrl:"https://starhealth.pre-dataprivacy.com/cpm-api/open-api/v1/preference/v1/export/getPreferenceDetails",
+    preferenceHistoryApiUrl:"https://starhealth.pre-dataprivacy.com/cpm-api/open-api/v1/preference/v1/export/auditSearch/scroll",
+    submitApiUrl:"https://starhealth.pre-dataprivacy.com/cpm-api/open-api/v1/preference/v1/createOrUpdateConsent",
+    signatureServiceUrl: "https://starhealth.pre-dataprivacy.com/cpm-sign",
+    userToken: "Bearer eyJhbGciOiJIUzM4NCJ9.eyJkYXRhUHJpbmNpcGFsSWQiOlt7ImtleSI6ImVtYWlsIiwidmFsdWUiOiJyZWxlYXNlMUB5b3BtYWlsLmNvbSJ9XSwiaWF0IjoxNzgyODAyMjcyLCJleHAiOjE3ODI4MDU4NzJ9.vlnC4W_3yBRLzaOTYAAOg7sn9NAE-gmZaCGdMifoWUSSZFdr7lPz_53c3u45D4nI",
+    customAttributes: {
+      "ticketID": "",
+      "registration ID": ""
+    },
     showButtons: true,
     showLanguageDropdown: true,
     enableCheckboxes: true,
     enableRadioButtons: true,
     enableDropdowns: true,
-
-    footerAlignment: "left"
+    footerAlignment: "left",
+    receivedType:"WEB"
   };
+  
 </script>
- 
-    <script src="script.js"></script>
+  
+<!--
+  Optional: Use custom buttons if the parent application
+  wants to control Consent Form submission and reset actions.
+
+  Note:
+  - Set `showButtons: false` in the widget configuration.
+  - Submit button calls `consentWidget.submit()`.
+  - Clear button calls `consentWidget.reset()`.
+-->
+
+<!--Example-->
+
+<!--
+<button id="parentClearBtn" style="padding:10px 16px; background:#dc2626; color:white; border:none; border-radius:6px;">
+  Clear Consent
+</button>
+<button id="parentSubmitBtn" style="padding:10px 16px; background:#16a34a; color:white; border:none; border-radius:6px;">
+  Submit Consent
+</button>
+
+<script>
+  document.getElementById("parentSubmitBtn").addEventListener("click", async () => {
+    if (!window.consentWidget) return;
+
+    const result = await window.consentWidget.submit();
+
+    console.log("Submit result:", result);
+
+    if (result.success) {
+      // navigate next page here
+      // window.location.href = "/next-page";
+    }
+  });
+
+  document.getElementById("parentClearBtn").addEventListener("click", () => {
+    if (!window.consentWidget) return;
+
+    window.consentWidget.reset();
+  });
+-->
+
+</script>
+<script src="script.js" integrity="sha384-WsHhKGvvW9ZyEN3NFIby8h1CywMvZ9ySKUh/PivZ2DFNIbSAbSijsSJq6stHrjS5" crossorigin="anonymous"></script>
   </body>
 </html>
    

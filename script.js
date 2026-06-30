@@ -3,19 +3,53 @@ const {
   preferenceDetailsApiUrl,
   preferenceHistoryApiUrl,
   submitApiUrl,
+  signatureServiceUrl,
   userToken,
-  dataPrincipalId,
   showButtons,
   showLanguageDropdown,
   enableCheckboxes,
   enableRadioButtons,
   enableDropdowns,
-  footerAlignment = "left"
+  footerAlignment = "left",
+  customAttributes,
+  receivedType
 } = window.consentWidgetConfig;
 
 let createConsentRequestList = [];
-let dataPrincipalIdList = [];
-let selectedLanguage = "en";
+let selectedLanguage = "english";
+let storedSigning = { bss: null, bssPublicKey: null, sss: null };
+let pendingSignController = null;
+let currentSnapshot = null;
+let consentJwt = null;
+
+const AES_KEY_B64 = "el+1+epeGlCquCYLsk3zyQTsq3KUKQKL9QcV0B9KIS8=";
+let globalSSS = null;
+let isSSSValid = false;
+
+function uint8ToBase64(bytes) {
+  const chunkSize = 0x8000;
+  let binary = "";
+
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(
+      null,
+      bytes.subarray(i, i + chunkSize)
+    );
+  }
+
+  return btoa(binary);
+}
+async function encryptPayload(body) {
+  const keyBytes = Uint8Array.from(atob(AES_KEY_B64), c => c.charCodeAt(0));
+  const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encoded = new TextEncoder().encode(JSON.stringify(body));
+  const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, cryptoKey, encoded);
+  const combined = new Uint8Array(iv.byteLength + cipher.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(cipher), iv.byteLength);
+  return uint8ToBase64(combined);
+}
 
 function authHeaders() {
   return {
@@ -23,6 +57,272 @@ function authHeaders() {
     "Authorization": userToken || ""
   };
 }
+
+// ── IndexedDB helper ──
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("consent-signing-store", 2);
+    req.onupgradeneeded = function(e) {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains("keys")) db.createObjectStore("keys");
+    };
+    req.onsuccess = e => resolve({
+      put: (store, val, key) => new Promise((res, rej) => {
+        const tx = e.target.result.transaction(store, "readwrite");
+        const r = tx.objectStore(store).put(val, key);
+        r.onsuccess = () => res(); r.onerror = () => rej(r.error);
+      }),
+      get: (store, key) => new Promise((res, rej) => {
+        const tx = e.target.result.transaction(store, "readonly");
+        const r = tx.objectStore(store).get(key);
+        r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+      }),
+    });
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Generates ECDSA P-256 key pair on first load; private key is non-extractable
+// and stored in IndexedDB. Public key is exported as SPKI base64.
+async function initSigningKey() {
+  try {
+    const db = await openDB();
+    const existing = await db.get("keys", "signingKeyEC");
+    if (existing) return;
+
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign", "verify"]
+    );
+
+    await db.put("keys", keyPair.privateKey, "signingKeyEC");
+
+    const pubKeyBuffer = await crypto.subtle.exportKey("spki", keyPair.publicKey);
+    const pubKeyB64 = btoa(String.fromCharCode(...new Uint8Array(pubKeyBuffer)));
+    await db.put("keys", pubKeyB64, "signingPublicKeyB64");
+  } catch (e) {
+    console.error("Signing key initialization failed:", e);
+  }
+}
+
+async function getPublicKeyB64() {
+  try {
+    const db = await openDB();
+    return await db.get("keys", "signingPublicKeyB64");
+  } catch (e) {
+    return null;
+  }
+}
+
+// Produces canonical JSON (sorted keys, no whitespace) matching Go's canonicalize.
+function canonicalizePayload(obj) {
+  if (Array.isArray(obj)) {
+    return "[" + obj.map(canonicalizePayload).join(",") + "]";
+  }
+  if (obj !== null && typeof obj === "object") {
+    var keys = Object.keys(obj).sort();
+    return "{" + keys.map(function(k) {
+      return JSON.stringify(k) + ":" + canonicalizePayload(obj[k]);
+    }).join(",") + "}";
+  }
+  return JSON.stringify(obj);
+}
+
+// Signs using ECDSA-P256; returns base64url IEEE P1363 signature.
+async function signPayload(payload) {
+  try {
+    const db = await openDB();
+    const privateKey = await db.get("keys", "signingKeyEC");
+    if (!privateKey) return null;
+
+    const encoded = new TextEncoder().encode(canonicalizePayload(payload));
+    const sigBuffer = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      privateKey,
+      encoded
+    );
+    return btoa(String.fromCharCode(...new Uint8Array(sigBuffer)))
+      .replace(/[+]/g, "-").replace(/[/]/g, "_").replace(/=/g, "");
+  } catch (e) {
+    console.error("Payload signing failed:", e);
+    return null;
+  }
+}
+
+// Converts ASN.1 DER ECDSA signature (Go output) to IEEE P1363 (WebCrypto input).
+function derToP1363(der) {
+  var off = 2;
+  if (der[1] === 0x81) off = 3;
+  off++;
+  var rLen = der[off++];
+  var rPad = (rLen === 33 && der[off] === 0x00) ? 1 : 0;
+  var rBytes = der.slice(off + rPad, off + rLen);
+  off += rLen;
+  off++;
+  var sLen = der[off++];
+  var sPad = (sLen === 33 && der[off] === 0x00) ? 1 : 0;
+  var sBytes = der.slice(off + sPad, off + sLen);
+  var result = new Uint8Array(64);
+  result.set(rBytes.slice(-32), 32 - Math.min(rBytes.length, 32));
+  result.set(sBytes.slice(-32), 64 - Math.min(sBytes.length, 32));
+  return result;
+}
+
+// Verifies the server-side ECDSA-SHA256 signature against the payload.
+async function verifySSS(payload, sssBase64Url, pemPublicKey) {
+  try {
+    let b64 = pemPublicKey
+      .replace(/-----BEGIN PUBLIC KEY-----/g, '')
+      .replace(/-----END PUBLIC KEY-----/g, '')
+      .replace(/\s+/g, '')
+      .replace(/[^A-Za-z0-9+/=]/g, '');
+    while (b64.length % 4 !== 0) { 
+        b64 += '=';
+    }
+    var der = Uint8Array.from(atob(b64), function(c) { return c.charCodeAt(0); });
+    var pubKey = await crypto.subtle.importKey("spki", der, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    var data = new TextEncoder().encode(canonicalizePayload(payload));
+    var sigB64 = sssBase64Url.replace(/-/g, "+").replace(/_/g, "/");
+    while (sigB64.length % 4) sigB64 += "=";
+    var derBytes = Uint8Array.from(atob(sigB64), function(c) { return c.charCodeAt(0); });
+    var p1363 = derToP1363(derBytes);
+    var result = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, pubKey, p1363, data);
+    return result;
+  } catch (e) {
+    return false;
+  }
+}
+function buildFinalConsentRequest(selectedLang) {
+  const requestList = [];
+  const consentDiv = document.getElementById("consent-root");
+
+  const allElements = consentDiv.querySelectorAll("[name]");
+
+  const pushConsent = (permissionId, optionId = null, hasValue = false) => {
+    let existing = requestList.find(r => r.permissionId === permissionId);
+
+    if (existing) {
+      if (hasValue) {
+        existing.optedForIndexes.push(parseInt(optionId));
+      }
+    } else {
+      requestList.push({
+        consentLanguage: selectedLang,
+        consentReceivedType: receivedType,
+        customAttributes,
+        permissionId,
+        optedForIndexes: hasValue ? [parseInt(optionId)] : []
+      });
+    }
+  };
+
+  allElements.forEach(el => {
+    const permissionId = el.name;
+
+    if (el.type === "checkbox" && enableCheckboxes) {
+      if (el.checked) {
+        pushConsent(permissionId, el.getAttribute("data-option-id") || "0", true);
+      } else {
+        pushConsent(permissionId, null, false);
+      }
+    }
+
+    else if (el.type === "radio" && enableRadioButtons) {
+      if (el.checked) {
+        pushConsent(permissionId, el.getAttribute("data-option-id") || "0", true);
+      } else {
+        // ensure permission exists even if nothing selected
+        pushConsent(permissionId, null, false);
+      }
+    }
+
+  else if (el.tagName === "SELECT" && enableDropdowns) {
+    const opt = el.options[el.selectedIndex];
+
+    if (opt && opt.value !== "") {
+      pushConsent(
+        permissionId,
+        opt.getAttribute("data-option-id") || "0",
+        true
+      );
+    }
+  }
+  });
+
+requestList.sort((a, b) =>
+  String(a.permissionId).localeCompare(String(b.permissionId))
+);
+
+const normalizedList = requestList.map(item => {
+  const sortedItem = {};
+  Object.keys(item)
+    .sort()
+    .forEach(key => {
+      sortedItem[key] = item[key];
+    });
+  return sortedItem;
+});
+
+return {
+  createConsentRequestDtoWrapper: normalizedList
+};
+}
+
+// Called on every radio/checkbox/dropdown change.
+async function onSelectionChange(selectedLang) {
+
+  const request = buildFinalConsentRequest(selectedLang);
+
+  // Always track the latest snapshot so stale in-flight responses fail verification.
+  currentSnapshot = request;
+  var bssPublicKey = await getPublicKeyB64();
+  var bss = await signPayload(currentSnapshot.createConsentRequestDtoWrapper);
+  if (!bss || !bssPublicKey) {
+   return; }
+
+  try {
+    var headers = { "Content-Type": "application/json", "Authorization": userToken || "" };
+
+    var res = await fetch(signatureServiceUrl + "/v1/sign", {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify({ payload: currentSnapshot.createConsentRequestDtoWrapper, bss: bss, bss_pkey: bssPublicKey })
+    });
+    if (!res.ok) {
+      var signErr = null;
+      try { signErr = await res.json(); } catch (e) {}
+      if (res.status === 401) showToast(" 401 Unauthorized", "error");
+      else if (res.status === 404) showToast(" 404 Not Found", "error");
+      else if (res.status === 500) showToast(" 500 Service Down", "error");
+      else if (signErr?.error?.code === "BSS_VERIFICATION_FAILED") showToast(" BSS authentication failed", "error");
+      else if (signErr?.error?.code === "SSS_VERIFICATION_FAILED") showToast(" SSS authentication failed", "error");
+      else showToast(" Signature service failed", "error");
+      return;
+    }
+    var signData = await res.json();
+    var sss = signData.sss;
+    globalSSS = sss;
+	
+    // Verify against currentSnapshot (latest) — if user changed selection while
+    // this request was in-flight, currentSnapshot !== snapshot and verification fails.
+    var valid = await verifySSS(currentSnapshot.createConsentRequestDtoWrapper, sss, signData.sss_pkey);
+
+    const submitBtn = document.getElementById("submitBtn");
+    if (valid) {
+      //storedSigning = { bss: bss, bssPublicKey: bssPublicKey, sss: sss };
+      isSSSValid = true;
+      if (submitBtn) submitBtn.disabled = false;
+    } else {
+      isSSSValid = false;
+      if (submitBtn) submitBtn.disabled = true;
+    }
+  } catch (e) {
+    console.error("[SDP-SIGN] Signature service call failed:", e);
+    showToast("v1/sign service unavailable", "error");
+  }
+}
+
 
 async function handleApiResponse(res) {
   let payload = {};
@@ -97,35 +397,39 @@ function attachHistoryScroll() {
 
   scrollContainer.dataset.scrollBound = "true";
 }
-function getDataPrincipalId() {
-  if (!Array.isArray(dataPrincipalId)) return [];
 
-  return dataPrincipalId.filter(({ key, value }) => key && value);
-}
 
 async function loadMoreHistory() {
   if (!historyPagination.hasMore || historyPagination.loading) return;
 
   historyPagination.loading = true;
+  historyPagination.failed = false;;
 
   try {
+    const scrollPayload = {
+      preferenceFormId,
+      page: historyPagination.page + 1,
+      pageSize: historyPagination.size,
+      sortBy: "formName",
+      sortDirection: "ASC"
+    };
+    const browserSignature = await signPayload(scrollPayload);
+    if (browserSignature) scrollPayload.bss = browserSignature;
+
  const res = await fetch(preferenceHistoryApiUrl, {
   method: "POST",
   headers: authHeaders(),
-  body: JSON.stringify({
-    preferenceFormId,
-    page: historyPagination.page + 1,
-    pageSize: historyPagination.size,
-    sortBy: "formName",
-    sortDirection: "ASC"
-  })
+  body: JSON.stringify(scrollPayload)
 });
 
 
    const result = await handleApiResponse(res);
-const response = result.response;
+   const response = result.response;
 
-
+  if (!response || !response.preferenceHistoryByTimeStamp) {
+    historyPagination.hasMore = false;
+    return;
+  }
     Object.entries(response.preferenceHistoryByTimeStamp || {}).forEach(
       ([timestamp, list]) => {
         if (!window.preferenceHistory[timestamp]) {
@@ -141,6 +445,11 @@ const response = result.response;
     renderHistory(window.preferenceHistory);
   } catch (e) {
     console.error("History scroll failed", e);
+
+    // STOP infinite retry loop
+    historyPagination.hasMore = false;
+    historyPagination.failed = true;
+
   } finally {
     historyPagination.loading = false;
   }
@@ -202,40 +511,59 @@ function renderLanguageDropdown(data) {
     langSelect.appendChild(opt);
   });
 
-  langSelect.onchange = () => {
-    selectedLanguage = langSelect.value;
+	langSelect.onchange = async () => {
+	  selectedLanguage = langSelect.value;
 
-    if (!document.getElementById("consent-root").classList.contains("hidden")) {
-      if (window.preferenceData?.currentPreference) {
-        renderConsent(window.preferenceData, selectedLanguage);
-      }
-    }
+	  const request = buildFinalConsentRequest(selectedLanguage);
 
-    if (!document.getElementById("historyTab").classList.contains("hidden")) {
-      renderHistory(window.preferenceHistory, selectedLanguage);
-    }
-  };
+	  if (window.preferenceData?.currentPreference) {
+		renderConsent(window.preferenceData, selectedLanguage);
+	  }
+
+	  if (!document.getElementById("historyTab").classList.contains("hidden")) {
+		renderHistory(window.preferenceHistory, selectedLanguage);
+	  }
+
+	  await onSelectionChange(selectedLanguage, request);
+	};
 }
 
 
 async function fetchConsentData() {
   try {
+    const publicKey = await getPublicKeyB64();
+    const browserSignature = await signPayload({ preferenceFormId });
+    const baseBody = {
+      preferenceFormId,
+      page: 0,
+      pageSize: 10,
+      sortBy: "formName",
+      sortDirection: "ASC",
+    };
+    if (publicKey) baseBody.bssk = publicKey;
     const res = await fetch(preferenceDetailsApiUrl, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({
-        preferenceFormId,
-        page: 0,          
-        pageSize: 10,      
-        sortBy: "formName",       
-        sortDirection: "ASC", 
-      }),
+      body: JSON.stringify(baseBody),
     });
 
 const result = await handleApiResponse(res);
-const data = result.response;
+consentJwt = result.response.payload;
+// decode JWT response
+const decoded = decodeJwt(result.response.payload);
+const data = decoded?.data?.response?.data;
+
+// NEW LINES YOU NEED TO ADD:
+const sssk = decoded.sssk;
+const bssk = decoded.bssk;
+const nonce = decoded.nonce;
 
 window.preferenceHistory = data.preferenceHistoryAgainstTimeStamp?.preferenceHistoryByTimeStamp || {};
+data.currentPreference.permissions =
+  (data.currentPreference?.permissions || [])
+    .map(p => ({ ...p }))
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+
 window.preferenceData = data;
  if (data.golabalFontFamily) {
   const fontFamily = data.golabalFontFamily;
@@ -252,14 +580,18 @@ window.preferenceData = data;
   }
 }
 
-selectedLanguage = data.languages?.[0]?.toLowerCase() || "en";
+// keep previously selected language after submit
+selectedLanguage = selectedLanguage || data.languages?.[0]?.toLowerCase() || "englis";
 renderLanguageDropdown(data);
 handlePreferenceView(data.preferenceView);
 if (data.currentPreference) {
   renderConsent(data, selectedLanguage);
+    setTimeout(() => {
+  onSelectionChange(selectedLanguage);
+}, 0);
 }
 
-    renderConsent(data, data.languages?.[0]?.toLowerCase() || "en");
+renderConsent(data, selectedLanguage);
     const container = document.querySelector(".widget-container");
     Array.from(container.children).forEach((child) => {
       child.style.display = "";
@@ -268,17 +600,6 @@ if (data.currentPreference) {
   } catch (e) {
       console.error(e);
 
-  }
-}
-
-function setDataPrincipalIdList() {
-  const { dataPrincipalId } = window.consentWidgetConfig || {};
-  if (Array.isArray(dataPrincipalId)) {
-    dataPrincipalId.forEach(({ key, value }) => {
-      if (key && value) {
-        dataPrincipalIdList.push({ key, value });
-      }
-    });
   }
 }
 
@@ -297,7 +618,6 @@ function showToast(message, type) {
 
 
 function getFormValues(selectedLang) {
-  setDataPrincipalIdList();
   createConsentRequestList = [];
 
   const consentDiv = document.getElementById("consent-root");
@@ -311,9 +631,9 @@ function getFormValues(selectedLang) {
       existing.optedForIndexes.push(parseInt(optionId));
     } else {
       createConsentRequestList.push({
-        dataPrincipalIdList,
         permissionId,
-        consentReceivedType: "FORMS",
+        customAttributes,
+        consentReceivedType: receivedType,
         optedForIndexes: [parseInt(optionId)],
         consentLanguage: selectedLang
       });
@@ -332,19 +652,30 @@ function getFormValues(selectedLang) {
     pushConsent(radio.name, optionId);
   });
 
+
   dropdowns.forEach(drop => {
     if (!enableDropdowns) return;
+
     const selected = drop.options[drop.selectedIndex];
+
+    // Skip unselected dropdown
+    if (!selected || !selected.value) return;
+
     const optionId = selected.getAttribute("data-option-id") || "0";
     pushConsent(drop.name, optionId);
   });
 
   document.querySelectorAll("#consent-root [name]").forEach(el => {
+
+    if (el.tagName === "SELECT") {
+      return;
+    }
+
     if (!createConsentRequestList.some(req => req.permissionId === el.name)) {
       createConsentRequestList.push({
-        dataPrincipalIdList,
+        customAttributes,
         permissionId: el.name,
-        consentReceivedType: "FORMS",
+        consentReceivedType: receivedType,
         optedForIndexes: [],
         consentLanguage: selectedLang
       });
@@ -353,14 +684,33 @@ function getFormValues(selectedLang) {
 
   sendConsent();
 }
-
+  
 async function sendConsent() {
   setFormDisabled(true);
   try {
+    createConsentRequestList.sort((a, b) =>
+  String(a.permissionId).localeCompare(String(b.permissionId))
+);
+    const body = { createConsentRequestDtoWrapper: createConsentRequestList };
+  console.log("request body:",JSON.stringify(body));
+    if (storedSigning.bss) {
+      body.bss = await signPayload(createConsentRequestList);
+      body.sss = globalSSS;
+      body.jwt=consentJwt;
+    } else {
+      const browserSignature = await signPayload(createConsentRequestList);
+      if (browserSignature) body.bss = browserSignature;
+      body.sss = globalSSS;
+      body.jwt=consentJwt;
+    }
+
+    const encryptedPayload = await encryptPayload(body);
     const res = await fetch(submitApiUrl, {
       method: "POST",
+      //headers: authHeaders(),
+      //body: JSON.stringify(body)
       headers: { "Content-Type": "application/json", "Authorization": userToken || "" },
-      body: JSON.stringify({ createConsentRequestDtoWrapper: createConsentRequestList })
+      body: JSON.stringify({ payload: encryptedPayload })
     });
     const data = await res.json();
     try {
@@ -370,22 +720,35 @@ async function sendConsent() {
     }
     if (data.response && data.statusCode === 200) {
       showToast("Consent saved successfully!", "success");
+	   setFormDisabled(false)
+	   fetchConsentData()
+     return data;
     } else {
       showToast(data.statusMessage || "Something went wrong.", "error");
       setFormDisabled(false);
+      fetchConsentData()
     }
-    setTimeout(() => window.location.reload(), 1500);
   } catch (err) {
     console.error(err);
     showToast("Failed to submit. Please check your network connection.", "error");
-    setTimeout(() => window.location.reload(), 1500);
     setFormDisabled(false);
+  } finally {
+    // Send response to Android WebView if available
+    if (typeof window.AndroidBridge !== 'undefined' && 
+        typeof window.AndroidBridge.onApiResponse === 'function') {
+      try {
+        window.AndroidBridge.onApiResponse(JSON.stringify(data));
+      } catch (error) {
+        console.error('Failed to send response to Android:', error);
+      }
+    }
   }
 }
 
 
+
 function isOptionSelected(perm, optionId, baseValue) {
-  const optedMap = perm.optedForMap || {};
+  const optedMap = perm.optedFor || {};
 
   if (Object.keys(optedMap).length > 0) {
     return !!optedMap[optionId];
@@ -592,6 +955,21 @@ function renderConsent(data, selectedLang) {
     const select = document.createElement("select");
     select.name = perm.id;
 
+    const defaultOption = document.createElement("option");
+    defaultOption.value = "";
+    defaultOption.text = "Select options";
+    defaultOption.disabled = true;
+
+    const hasSelection =
+      (Array.isArray(perm.optedFor) && perm.optedFor.length > 0) ||
+      (perm.optedFor &&
+        typeof perm.optedFor === "object" &&
+        Object.keys(perm.optedFor).length > 0);
+
+    defaultOption.selected = !hasSelection;
+
+    select.appendChild(defaultOption);
+
     if (Object.keys(optionMap).length > 0) {
       const mapEntries = Object.entries(optionMap);
       const translatedOptions = tr?.options || perm.options || [];
@@ -617,6 +995,9 @@ function renderConsent(data, selectedLang) {
     block.appendChild(select);
   }
 
+  block.querySelectorAll("input, select").forEach(function(el) {
+    el.addEventListener("change", function() { onSelectionChange(selectedLang); });
+  });
   root.appendChild(block);
 });
 
@@ -646,8 +1027,8 @@ function renderConsent(data, selectedLang) {
 
     submitBtn.style.display = "block";
     submitBtn.innerText = submitLabel;
+    submitBtn.disabled = !isSSSValid;
 
-    if (branding.primaryButtonbgColor)
       submitBtn.style.backgroundColor =
         branding.primaryButtonbgColor;
     if (branding.primaryFontColor)
@@ -755,12 +1136,25 @@ function renderConsent(data, selectedLang) {
 getFormValues(selectedLanguage);
   };
 
-  cancelBtn.onclick = () => {
-    window.location.reload();
-  };
-}
+cancelBtn.onclick = async () => {
+  if (window.preferenceData?.currentPreference) {
+    // Reset form to original state
+    renderConsent(window.preferenceData, selectedLanguage);
 
-fetchConsentData();
+    // Clear previous signature state
+    globalSSS = null;
+    isSSSValid = false;
+
+    const submitBtn = document.getElementById("submitBtn");
+    if (submitBtn) {
+      submitBtn.disabled = true;
+    }
+
+    // Generate fresh BSS + SSS for restored selections
+    await onSelectionChange(selectedLanguage);
+  }
+};
+}
 
 function switchToCurrent() {
   document
@@ -807,10 +1201,9 @@ function switchToHistory() {
     "none";
   toggleFooterButtons(false);
 
-  if (!window.historyRendered && window.preferenceHistory) {
-    renderHistory(window.preferenceHistory);
-    window.historyRendered = true;
-  }
+if (window.preferenceHistory) {
+  renderHistory(window.preferenceHistory, selectedLanguage);
+}
   attachHistoryScroll();
 
 }
@@ -879,7 +1272,7 @@ function renderHistory(historyDto, selectedLang = "en") {
   }
 
   Object.keys(historyDto)
-    .sort((a, b) => Number(b) - Number(a)) 
+    .sort((a, b) => new Date(b) - new Date(a))
     .forEach((timestamp) => {
       const record = document.createElement("div");
       record.className = "history-record";
@@ -887,8 +1280,7 @@ function renderHistory(historyDto, selectedLang = "en") {
       
       const dateHeader = document.createElement("div");
       dateHeader.className = "history-date";
-      const date = new Date(Number(timestamp));
-
+      const date = new Date(timestamp);
       const datePart = date.toLocaleDateString("en-US", {
         month: "short",
         day: "2-digit",
@@ -957,6 +1349,102 @@ if (children.length > 0) {
     });
 }
 
+
+
+
 document.getElementById("tab-current").addEventListener("click", switchToCurrent);
 document.getElementById("tab-history").addEventListener("click", switchToHistory);
+
+function decodeJwt(token) {
+  const base64Url = token.split('.')[1];
+  const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+
+  const jsonPayload = decodeURIComponent(
+    atob(base64)
+      .split('')
+      .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+      .join('')
+  );
+
+  return JSON.parse(jsonPayload);
+}
+
+
+
+async function submitConsent() {
+  return await sendConsent();
+}
+
+function resetConsent() {
+  resetWidget();
+}
+
+function getConsentState() {
+  return {
+    payload: createConsentRequestList,
+    jwt: consentJwt,
+    sss: globalSSS
+  };
+}
+async function resetWidget() {
+  if (window.preferenceData?.currentPreference) {
+    // Restore original state
+    renderConsent(window.preferenceData, selectedLanguage);
+
+    // Clear old signature
+    globalSSS = null;
+    isSSSValid = false;
+
+    const submitBtn = document.getElementById("submitBtn");
+    if (submitBtn) {
+      submitBtn.disabled = true;
+    }
+
+    // Generate fresh BSS + SSS
+    await onSelectionChange(selectedLanguage);
+  }
+}
+
+window.consentWidget = {
+  submit: async () => {
+    try {
+      const langSelect = document.getElementById("langSelect");
+
+      const selectedLang =
+        langSelect?.value ||
+        document.documentElement.lang ||
+        "en";
+
+      const payload = buildFinalConsentRequest(selectedLang);
+
+      // IMPORTANT: ensure we don't send empty payload
+      if (!payload?.createConsentRequestDtoWrapper?.length) {
+        return {
+          success: false,
+          error: "Empty consent selection"
+        };
+      }
+
+      createConsentRequestList = payload.createConsentRequestDtoWrapper;
+
+      const result = await sendConsent();
+
+      return {
+        success: true,
+        data: result
+      };
+
+    } catch (err) {
+      return {
+        success: false,
+        error: err.message
+      };
+    }
+  },
+
+  reset: () => resetWidget()
+};
+
+  
+initSigningKey().then(fetchConsentData);
 
